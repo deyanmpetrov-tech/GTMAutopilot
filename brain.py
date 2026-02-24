@@ -1041,7 +1041,11 @@ def _step2_validate_signals(client, model: str, crawler_data: dict, platform_res
     forms_processed = crawler_data.get("forms_processed", [])
 
     for i, form_data in enumerate(forms_processed):
-        fi = int(form_data.get("form_index", i))
+        _raw_fi = form_data.get("form_index", i)
+        try:
+            fi = int(_raw_fi)
+        except (ValueError, TypeError):
+            fi = i  # Fallback for non-numeric indices like "shadow_0"
         is_shadow = form_data.get("is_shadow_form", False)
 
         # ── User-Selected Method Passthrough ─────────────────────────
@@ -1427,11 +1431,17 @@ def _step5_audit_and_compile(client, model: str,
         return {"tracking_plan": []}
 
     # ── Preserve _source_form_index before AI audit (BUG-2 fix) ──
-    _fi_map = {}
+    # Use (event_name, position_among_same_event) as composite key to handle
+    # multiple forms sharing the same event_name (e.g. two "form_submit" forms).
+    _fi_map: dict[tuple[str, int], object] = {}
+    _event_counter: dict[str, int] = {}
     for item in compiled_plan:
         fi = item.get("_source_form_index")
         if fi is not None:
-            _fi_map[item.get("event_name", "")] = fi
+            ename = item.get("event_name", "")
+            pos = _event_counter.get(ename, 0)
+            _event_counter[ename] = pos + 1
+            _fi_map[(ename, pos)] = fi
 
     # ── Phase A: Deterministic micro-fixers (cheap, no API calls) ──
     compiled_plan = _fix_regex_patterns(compiled_plan)
@@ -1504,8 +1514,17 @@ Rules:
                 "qa_test_steps": it.qa_test_steps,
                 "is_shadow_form": False,        # AI audit doesn't preserve per-form metadata
                 "is_iframe_embedded": False,     # Same — use pre-audit values for display
-                "_source_form_index": _fi_map.get(it.event_name),  # Restore from pre-audit map
+                "_source_form_index": None,  # Restored below from pre-audit map; stripped before return
             })
+
+        # ── Restore _source_form_index from pre-audit map (BUG-2 fix) ──
+        _restore_counter: dict[str, int] = {}
+        for item in corrected_plans:
+            ename = item.get("event_name", "")
+            pos = _restore_counter.get(ename, 0)
+            _restore_counter[ename] = pos + 1
+            if item.get("_source_form_index") is None:
+                item["_source_form_index"] = _fi_map.get((ename, pos))
 
         # ── Guard against AI item reduction (P0-4) ──
         if len(corrected_plans) < len(compiled_plan):
@@ -1770,7 +1789,7 @@ def classify_forms(
         "forms_processed": [
             {
                 **f,
-                "form_index": int(f.get("form_index", i)),  # P1-2: normalize to int
+                "form_index": (int(f.get("form_index", i)) if str(f.get("form_index", i)).isdigit() else i),  # P1-2: safe int normalize
                 "datalayer_events": f.get("datalayer_events", []),
                 "is_successful_submission": f.get("is_successful_submission", False),
                 "dom_payload_keys": f.get("dom_payload_keys", []),
@@ -1801,7 +1820,7 @@ def classify_forms(
         raise RuntimeError("Класификацията на формите се провали. Проверете API ключа и квотата.")
 
     return {
-        str(f.form_index): {
+        str(f.form_index): {  # String keys — app.py accesses via str(fi)
             "form_type": f.form_type,
             "form_role": f.form_role,
             "confidence": f.platform_confidence,
