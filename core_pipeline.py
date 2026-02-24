@@ -870,7 +870,7 @@ class PipelineOrchestrator:
         self._listener.on_step_start(
             PipelineStage.HEAL, "Healing container schema..."
         )
-        updated_gtm = heal_gtm_container(updated_gtm)
+        updated_gtm = heal_gtm_container(updated_gtm, crawler_data=self._result.crawler_data)
         self._listener.on_step_complete(PipelineStage.HEAL, "Healing complete.")
 
         # ── Stage: Validate ─────────────────────────────────────────────

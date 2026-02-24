@@ -77,6 +77,126 @@ RECIPES: dict[str, dict] = {
         ],
     },
 
+    # ── jQuery AJAX Listener (Bounteous / LunaMetrics) ─────────────────────
+    "ajax_complete": {
+        "name": "jQuery AJAX Listener",
+        "platform_signals": ["jquery", "ajaxComplete"],
+        "listener": {
+            "tag_name": "Auto - AJAX Auto-Event Listener",
+            "script": (
+                '<script id="gtm-jq-ajax-listen" type="text/javascript">\n'
+                '(function() {\n'
+                "  'use strict';\n"
+                '  var $;\n'
+                '  var n = 0;\n'
+                '  init();\n'
+                '\n'
+                '  function init(n) {\n'
+                "    if (typeof jQuery !== 'undefined') {\n"
+                '      $ = jQuery;\n'
+                '      bindToAjax();\n'
+                '    } else if (n < 20) {\n'
+                '      n++;\n'
+                '      setTimeout(init, 500);\n'
+                '    }\n'
+                '  }\n'
+                '\n'
+                '  function bindToAjax() {\n'
+                "    $(document).bind('ajaxComplete', function(evt, jqXhr, opts) {\n"
+                "      var fullUrl = document.createElement('a');\n"
+                '      fullUrl.href = opts.url;\n'
+                "      var pathname = fullUrl.pathname[0] === '/' ? fullUrl.pathname : '/' + fullUrl.pathname;\n"
+                "      var queryString = fullUrl.search[0] === '?' ? fullUrl.search.slice(1) : fullUrl.search;\n"
+                "      var queryParameters = objMap(queryString, '&', '=', true);\n"
+                "      var headers = objMap(jqXhr.getAllResponseHeaders(), '\\\\n', ':');\n"
+                '      dataLayer.push({\n'
+                "        'event': 'ajaxComplete',\n"
+                "        'attributes': {\n"
+                "          'type': opts.type || '',\n"
+                "          'url': fullUrl.href || '',\n"
+                "          'queryParameters': queryParameters,\n"
+                "          'pathname': pathname || '',\n"
+                "          'hostname': fullUrl.hostname || '',\n"
+                "          'protocol': fullUrl.protocol || '',\n"
+                "          'fragment': fullUrl.hash || '',\n"
+                "          'statusCode': jqXhr.status || '',\n"
+                "          'statusText': jqXhr.statusText || '',\n"
+                "          'headers': headers,\n"
+                "          'timestamp': evt.timeStamp || '',\n"
+                "          'contentType': opts.contentType || '',\n"
+                "          'response': (jqXhr.responseJSON || jqXhr.responseXML || jqXhr.responseText || '')\n"
+                '        }\n'
+                '      });\n'
+                '    });\n'
+                '  }\n'
+                '\n'
+                '  function objMap(data, delim, spl, decode) {\n'
+                '    var obj = {};\n'
+                '    if (!data || !delim || !spl) { return {}; }\n'
+                '    var arr = data.split(delim);\n'
+                '    for (var i = 0; i < arr.length; i++) {\n'
+                '        var item = decode ? decodeURIComponent(arr[i]) : arr[i];\n'
+                '        var pair = item.split(spl);\n'
+                '        var key = trim_(pair[0]);\n'
+                '        var value = trim_(pair[1]);\n'
+                '        if (key && value) { obj[key] = value; }\n'
+                '    }\n'
+                '    return obj;\n'
+                '  }\n'
+                '\n'
+                '  function trim_(str) {\n'
+                "    if (str) { return str.replace(/^[\\\\s\\\\uFEFF\\\\xA0]+|[\\\\s\\\\uFEFF\\\\xA0]+$/g, ''); }\n"
+                '  }\n'
+                '})();\n'
+                '/*\n'
+                ' * Based on the jQuery AJAX Listener by Bounteous (formerly LunaMetrics)\n'
+                ' * Licensed under Creative Commons 4.0 Attribution Public License\n'
+                ' */\n'
+                '</script>'
+            ),
+            "extra_params": [
+                {"type": "BOOLEAN", "key": "supportDocumentWrite", "value": "false"},
+            ],
+        },
+        "plan_item": {
+            "event_name": "form_submission",
+            "trigger_type": "custom_event",
+            "tag_name": "Auto - GA4 Event - form_submission",
+            "trigger_name": "Auto - CE - ajaxComplete",
+            "trigger_condition": {"event": "ajaxComplete"},
+            "gtm_payload_keys": [],
+            "payload_schema": {},
+            "semantic_mapping": {},
+            "built_ins_to_activate": ["Page URL", "Page Path"],
+            "variables_to_create": [],
+            "confidence": 0.95,
+            "confidence_reason": "Known AJAX listener recipe \u2014 Bounteous/LunaMetrics production-tested GTM template.",
+            "failure_risks": [
+                "Requires jQuery on the page. Will not fire if site uses vanilla JS AJAX.",
+            ],
+            "qa_test_steps": [
+                "Submit form \u2192 verify ajaxComplete event in dataLayer",
+                "Check attributes.statusCode == 200 and attributes.url matches the form endpoint",
+                "Verify GA4 tag fires with correct parameters",
+            ],
+        },
+        "dl_variables": [
+            {"name": "DLV - attributes.type",            "dl_key": "attributes.type"},
+            {"name": "DLV - attributes.url",             "dl_key": "attributes.url"},
+            {"name": "DLV - attributes.queryParameters", "dl_key": "attributes.queryParameters"},
+            {"name": "DLV - attributes.pathname",        "dl_key": "attributes.pathname"},
+            {"name": "DLV - attributes.hostname",        "dl_key": "attributes.hostname"},
+            {"name": "DLV - attributes.protocol",        "dl_key": "attributes.protocol"},
+            {"name": "DLV - attributes.fragment",        "dl_key": "attributes.fragment"},
+            {"name": "DLV - attributes.statusCode",      "dl_key": "attributes.statusCode"},
+            {"name": "DLV - attributes.statusText",      "dl_key": "attributes.statusText"},
+            {"name": "DLV - attributes.headers",         "dl_key": "attributes.headers"},
+            {"name": "DLV - attributes.timestamp",       "dl_key": "attributes.timestamp"},
+            {"name": "DLV - attributes.contentType",     "dl_key": "attributes.contentType"},
+            {"name": "DLV - attributes.response",        "dl_key": "attributes.response"},
+        ],
+    },
+
     # ── HubSpot Embedded Forms ──────────────────────────────────────────────
     "hubspot": {
         "name": "HubSpot Form",
@@ -225,15 +345,19 @@ def inject_recipe_listener(
     from main import get_max_id
     tag_id = str(get_max_id(cv.get("tag", []), "tagId") + 1) + "000"
 
+    tag_params = [
+        {"type": "TEMPLATE", "key": "html", "value": listener["script"]},
+    ]
+    # Append any extra parameters (e.g., supportDocumentWrite)
+    tag_params.extend(listener.get("extra_params", []))
+
     listener_tag = {
         "accountId": account_id,
         "containerId": container_id,
         "tagId": tag_id,
         "name": tag_name,
         "type": "html",
-        "parameter": [
-            {"type": "TEMPLATE", "key": "html", "value": listener["script"]},
-        ],
+        "parameter": tag_params,
         "firingTriggerId": ["2147479553"],  # All Pages
     }
 

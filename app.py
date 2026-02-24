@@ -582,6 +582,15 @@ with tab_builder:
                     _tech_sig = signal.get("technology_signals", [])
                     _recipe_match = get_recipe_for_platform(_platform, _tech_sig)
 
+                    # Method-based recipe matching (e.g., ajax_complete)
+                    if not _recipe_match:
+                        from recipes import RECIPES as _ALL_RECIPES
+                        for _m in methods:
+                            _method_name = _m.get("method", "")
+                            if _method_name in _ALL_RECIPES:
+                                _recipe_match = (_method_name, _ALL_RECIPES[_method_name])
+                                break
+
                     if _recipe_match:
                         _rkey, _recipe = _recipe_match
                         _dl_event = _recipe["plan_item"]["trigger_condition"]["event"]

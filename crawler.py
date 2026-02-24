@@ -385,6 +385,9 @@ async def auto_accept_consent(page, log) -> bool:
         ".cmplz-accept",                       # Complianz
         ".brlbs-btn-accept-all",               # Borlabs
         "#cookie-law-info-bar ~ * .cli-plugin-button", # Cookie Law Info
+        "#cookie-bar button, #cookie-bar a",          # Generic cookie bar (PrestaShop и др.)
+        "#consent-banner-main button",                 # Custom consent banner
+        ".cc-btn.cc-allow",                            # CookieConsent (Insites legacy)
         "[id*='cookie'] button:has-text('Accept')", # Generic fallback
         "[class*='cookie'] button:has-text('Accept')",
         "button:has-text('Accept All')",
@@ -1173,6 +1176,7 @@ async def measure_forms(
                         log(f"[Measure]   → {r['status']} {r['url'][:120]}{extra}")
                     form_data["is_ajax_submission"] = True
                     form_data["has_successful_ajax"] = len(successful_ajax) > 0
+                    form_data["ajax_responses"] = ajax_responses  # For healer GA4 ID extraction
                     if successful_ajax:
                         form_data["ajax_endpoint"] = successful_ajax[0]["url"]
 

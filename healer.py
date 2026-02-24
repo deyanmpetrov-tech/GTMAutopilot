@@ -1,7 +1,7 @@
 import copy
 import json
 
-def heal_gtm_container(gtm_json: dict) -> dict:
+def heal_gtm_container(gtm_json: dict, crawler_data: dict | None = None) -> dict:
     """
     Self-healing routine for GTM JSON exports.
     Automatically detects and fixes common schema violations to ensure successful import.
@@ -72,7 +72,19 @@ def heal_gtm_container(gtm_json: dict) -> dict:
                 if val.startswith("G-") and val != "G-HEALEDID00":
                     fallback_ga_id = val
                     break
-    
+
+    # If still placeholder, extract GA4 ID from crawler AJAX URLs
+    if fallback_ga_id == "G-HEALEDID00" and crawler_data:
+        import re
+        for form in crawler_data.get("forms_processed", []):
+            for ajax in form.get("ajax_responses", []):
+                match = re.search(r'[?&]tid=(G-[A-Z0-9]+)', ajax.get("url", ""))
+                if match:
+                    fallback_ga_id = match.group(1)
+                    break
+            if fallback_ga_id != "G-HEALEDID00":
+                break
+
     for tag in tags:
         # tagFiringOption is required for ALL tags (GTM may reject import without it)
         if not tag.get("tagFiringOption"):
@@ -93,6 +105,25 @@ def heal_gtm_container(gtm_json: dict) -> dict:
 
             if not has_override:
                 params.append({"type": "TEMPLATE", "key": "measurementIdOverride", "value": fallback_ga_id})
+
+            # sign_up events should have 'method' parameter (GA4 recommended)
+            event_name = next((p.get("value") for p in params if p.get("key") == "eventName"), None)
+            if event_name and event_name.startswith("sign_up"):
+                for p in params:
+                    if p.get("key") == "eventSettingsTable":
+                        has_method = any(
+                            any(m.get("value") == "method" for m in row.get("map", []))
+                            for row in p.get("list", [])
+                        )
+                        if not has_method:
+                            p["list"].append({
+                                "type": "MAP",
+                                "map": [
+                                    {"type": "TEMPLATE", "key": "parameter", "value": "method"},
+                                    {"type": "TEMPLATE", "key": "parameterValue", "value": "form"}
+                                ]
+                            })
+                        break
 
     # ── 3. Fix Trigger Required Parameters ────────────────────────────────────
     for trigger in triggers:
