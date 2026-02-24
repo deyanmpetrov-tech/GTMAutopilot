@@ -134,6 +134,7 @@ class _TeeListener:
     def on_log(self, message):
         self._tee(message)
         self._inner.on_log(message)
+    on_log._tees_to_pipeline_log = True
 
     def on_error(self, stage, error):
         self._tee(f"   ↳ ❌ {stage.value}: {error}")
