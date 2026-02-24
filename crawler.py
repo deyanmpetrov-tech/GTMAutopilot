@@ -1316,14 +1316,13 @@ async def measure_forms(
 
                 form_data["form_submitted"] = True
                 result["forms_processed"].append(form_data)
-
-                # Cache it
-                if target_hash:
-                    cache.add(target_hash)
-                    save_cache(cache, session_id=session_id)
             except Exception as e:
                 log(f"[Measure] Post-submission processing error: {e}")
             finally:
+                # Cache submitted form regardless of post-processing errors (prevents duplicate submissions)
+                if target_hash:
+                    cache.add(target_hash)
+                    save_cache(cache, session_id=session_id)
                 # P2-1: Guaranteed removal of per-form AJAX listeners (BUG-01)
                 page.remove_listener("request", req_handler)
                 page.remove_listener("response", res_handler)
@@ -1903,12 +1902,12 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
 
                 form_data["form_submitted"] = True
                 result["forms_processed"].append(form_data)
-
-                cache.add(form_hash)
-                save_cache(cache, session_id=session_id)
             except Exception as e:
                 log(f"  ⚠️ Post-submission processing error for form #{i+1}: {e}")
             finally:
+                # Cache submitted form regardless of post-processing errors (prevents duplicate submissions)
+                cache.add(form_hash)
+                save_cache(cache, session_id=session_id)
                 # P2-1: Guaranteed removal of per-form AJAX listeners (BUG-06)
                 page.remove_listener("request", req_handler)
                 page.remove_listener("response", res_handler)
