@@ -1,0 +1,10 @@
+playwright
+google-genai
+pydantic
+
+streamlit
+
+fastapi
+uvicorn
+python-multipart
+playwright-stealth

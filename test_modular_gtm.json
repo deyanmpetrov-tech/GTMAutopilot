@@ -1,0 +1,12 @@
+{
+  "exportFormatVersion": 2,
+  "exportTime": "2023-10-10 10:00:00",
+  "containerVersion": {
+    "path": "accounts/123/containers/456/versions/0",
+    "accountId": "123",
+    "containerId": "456",
+    "containerVersionId": "0",
+    "trigger": [],
+    "tag": []
+  }
+}

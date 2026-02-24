@@ -1,0 +1,82 @@
+{
+  "tracking_plan": [
+    {
+      "_source_form_index": 1,
+      "event_name": "sign_up",
+      "trigger_type": "page_view",
+      "tag_name": "Auto - GA4 Event - sign_up",
+      "trigger_name": "Auto - PV - Root Path",
+      "variables_to_create": [
+        {
+          "gtm_var_name": "DLV - Email",
+          "dl_key": "your-email",
+          "var_type": "string",
+          "ga4_param": "email"
+        },
+        {
+          "gtm_var_name": "DLV - User Consent",
+          "dl_key": "acceptance-210",
+          "var_type": "boolean",
+          "ga4_param": "user_consent"
+        }
+      ],
+      "built_ins_to_activate": [
+        "Page Path",
+        "Page URL"
+      ],
+      "gtm_payload_keys": [
+        "acceptance-210"
+      ],
+      "payload_schema": {
+        "your-email": "string",
+        "acceptance-210": "boolean"
+      },
+      "semantic_mapping": {
+        "acceptance-210": "user_consent"
+      },
+      "trigger_condition": {
+        "page_path_regex": "^/?(\\?.*)?(#.*)?/?(\\?.*)?$"
+      },
+      "confidence": 0.9,
+      "confidence_reason": "Step 2 signal: page_view",
+      "notes": "Triggered on page view with a regex matching all pages, indicating a global element (footer form). Form identified by unique ID.",
+      "orphaned_bridge": true,
+      "proximity_filter": "#wpcf7-f28-o1",
+      "is_global_element": true,
+      "requires_trigger_group": false,
+      "selector_critic": null,
+      "failure_risks": [],
+      "qa_test_steps": [],
+      "user_provided_data": [
+        {
+          "key": "your-email",
+          "value": "email"
+        }
+      ]
+    }
+  ],
+  "pipeline_warnings": {
+    "errors": [
+      {
+        "step": "step4_strategy",
+        "form": 2,
+        "msg": "Gemini API failed for form #2 strategy \u2014 form will not appear in final plan."
+      }
+    ],
+    "warnings": [
+      {
+        "step": "step5_audit",
+        "form": null,
+        "msg": "Auditor API call failed \u2014 returning un-audited plan without self-correction."
+      },
+      {
+        "step": "step6_sop",
+        "form": null,
+        "msg": "SOP generation failed \u2014 documentation will not be included."
+      }
+    ],
+    "skipped_forms": [
+      2
+    ]
+  }
+}

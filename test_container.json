@@ -1,0 +1,65 @@
+{
+    "exportFormatVersion": 2,
+    "exportTime": "2024-01-01 00:00:00",
+    "containerVersion": {
+        "path": "accounts/123/containers/456/versions/0",
+        "accountId": "123",
+        "containerId": "456",
+        "containerVersionId": "0",
+        "container": {
+            "path": "accounts/123/containers/456",
+            "accountId": "123",
+            "containerId": "456",
+            "name": "AutoGTM Test Container",
+            "publicId": "GTM-TEST123",
+            "usageContext": [
+                "WEB"
+            ]
+        },
+        "tag": [
+            {
+                "accountId": "123",
+                "containerId": "456",
+                "tagId": "1",
+                "name": "GA4 - Config",
+                "type": "gaawc",
+                "parameter": [
+                    {
+                        "type": "TEMPLATE",
+                        "key": "measurementId",
+                        "value": "G-TESTID123"
+                    }
+                ],
+                "firingTriggerId": [
+                    "2147479553"
+                ],
+                "tagFiringOption": "ONCE_PER_EVENT"
+            }
+        ],
+        "trigger": [
+            {
+                "accountId": "123",
+                "containerId": "456",
+                "triggerId": "2147479553",
+                "name": "All Pages",
+                "type": "PAGEVIEW"
+            }
+        ],
+        "variable": [],
+        "builtInVariable": [
+            {
+                "accountId": "123",
+                "containerId": "456",
+                "type": "PAGE_URL",
+                "name": "Page URL"
+            },
+            {
+                "accountId": "123",
+                "containerId": "456",
+                "type": "PAGE_PATH",
+                "name": "Page Path"
+            }
+        ],
+        "fingerprint": "1234567890"
+    }
+}

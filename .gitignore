@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+
+# Debug & cache
+.debug/
+.cache/
+.pytest_cache/
+
+# Logs
+*.log
+pipeline.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Exports (generated GTM containers)
+exports/
+
+# Test/output artifacts
+output_gtm.json
+output_test.json
+final_api_output.json
+downloaded_gtm_test.json
+dummy_gtm.json
+dummy_test_container.json
+AutoGTM_Enhanced_Container*.json
+e2e_ui_success.png
+tracking_spec.md
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+
+# Claude Code internals
+.claude/
+
+# Config with secrets
+.autogtm_config.json
