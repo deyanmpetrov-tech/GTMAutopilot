@@ -1069,9 +1069,23 @@ async def measure_forms(
             ajax_requests = []
             ajax_responses = []
             req_handler = lambda req: ajax_requests.append(req.url) if req.method in ["POST", "PUT", "PATCH"] else None
-            res_handler = lambda res: ajax_responses.append({"url": res.request.url, "status": res.status}) if res.request.method in ["POST", "PUT", "PATCH"] else None
+
+            async def _capture_response_measure(res):
+                if res.request.method not in ["POST", "PUT", "PATCH"]:
+                    return
+                entry = {"url": res.request.url, "status": res.status}
+                # CF7: capture response body for actual submission status
+                if "contact-form-7" in res.request.url or "wpcf7" in res.request.url:
+                    try:
+                        body = await res.json()
+                        entry["cf7_status"] = body.get("status", "")
+                        entry["cf7_message"] = str(body.get("message", ""))[:100]
+                    except Exception:
+                        pass
+                ajax_responses.append(entry)
+
             page.on("request", req_handler)
-            page.on("response", res_handler)
+            page.on("response", _capture_response_measure)
 
             dl_start_len = len(datalayer_events)
 
@@ -1128,6 +1142,9 @@ async def measure_forms(
                 except Exception:
                     pass
 
+                # Additional wait for CF7 DOM updates (success element animations)
+                await page.wait_for_timeout(2000)
+
                 current_full_url = page.url
                 if "#wpcf7" in current_full_url or "#confirmation" in current_full_url:
                     form_data["redirect_url"] = current_full_url
@@ -1138,10 +1155,22 @@ async def measure_forms(
 
             # BUG-01: Wrap post-submission processing in try/finally to guarantee listener cleanup
             try:
-                # Evaluate AJAX activity
-                successful_ajax = [res for res in ajax_responses if 200 <= res["status"] < 300]
+                # Evaluate AJAX activity (CF7-aware: check response body status)
+                successful_ajax = []
+                for res in ajax_responses:
+                    if 200 <= res["status"] < 300:
+                        cf7_status = res.get("cf7_status", "")
+                        if cf7_status and cf7_status not in ("mail_sent", ""):
+                            continue  # CF7 validation failure (HTTP 200 but body says error)
+                        successful_ajax.append(res)
                 if not form_data["redirect_url"] and len(ajax_requests) > 0:
                     log(f"[Measure] Detected {len(ajax_requests)} background requests ({len(successful_ajax)} successful).")
+                    # Detailed AJAX log for diagnostics
+                    for r in ajax_responses:
+                        extra = ""
+                        if r.get("cf7_status"):
+                            extra = f" [CF7: {r['cf7_status']}]"
+                        log(f"[Measure]   → {r['status']} {r['url'][:120]}{extra}")
                     form_data["is_ajax_submission"] = True
                     form_data["has_successful_ajax"] = len(successful_ajax) > 0
                     if successful_ajax:
@@ -1325,7 +1354,7 @@ async def measure_forms(
                     save_cache(cache, session_id=session_id)
                 # P2-1: Guaranteed removal of per-form AJAX listeners (BUG-01)
                 page.remove_listener("request", req_handler)
-                page.remove_listener("response", res_handler)
+                page.remove_listener("response", _capture_response_measure)
 
             await page.wait_for_timeout(2000)
 
@@ -1649,9 +1678,23 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
             ajax_requests = []
             ajax_responses = []
             req_handler = lambda req: ajax_requests.append(req.url) if req.method in ["POST", "PUT", "PATCH"] else None
-            res_handler = lambda res: ajax_responses.append({"url": res.request.url, "status": res.status}) if res.request.method in ["POST", "PUT", "PATCH"] else None
+
+            async def _capture_response_crawl(res):
+                if res.request.method not in ["POST", "PUT", "PATCH"]:
+                    return
+                entry = {"url": res.request.url, "status": res.status}
+                # CF7: capture response body for actual submission status
+                if "contact-form-7" in res.request.url or "wpcf7" in res.request.url:
+                    try:
+                        body = await res.json()
+                        entry["cf7_status"] = body.get("status", "")
+                        entry["cf7_message"] = str(body.get("message", ""))[:100]
+                    except Exception:
+                        pass
+                ajax_responses.append(entry)
+
             page.on("request", req_handler)
-            page.on("response", res_handler)
+            page.on("response", _capture_response_crawl)
 
             dl_start_len = len(datalayer_events)
 
@@ -1707,6 +1750,9 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
                 except Exception:
                     pass
 
+                # Additional wait for CF7 DOM updates (success element animations)
+                await page.wait_for_timeout(2000)
+
                 current_full_url = page.url
                 if "#wpcf7" in current_full_url or "#confirmation" in current_full_url:
                     form_data["redirect_url"] = current_full_url
@@ -1717,10 +1763,22 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
 
             # BUG-06: Wrap post-submission processing in try/finally to guarantee listener cleanup
             try:
-                # Evaluate AJAX activity
-                successful_ajax = [res for res in ajax_responses if 200 <= res["status"] < 300]
+                # Evaluate AJAX activity (CF7-aware: check response body status)
+                successful_ajax = []
+                for res in ajax_responses:
+                    if 200 <= res["status"] < 300:
+                        cf7_status = res.get("cf7_status", "")
+                        if cf7_status and cf7_status not in ("mail_sent", ""):
+                            continue  # CF7 validation failure (HTTP 200 but body says error)
+                        successful_ajax.append(res)
                 if not form_data["redirect_url"] and len(ajax_requests) > 0:
                     log(f"Detected {len(ajax_requests)} background API requests ({len(successful_ajax)} successful) after clicking submit.")
+                    # Detailed AJAX log for diagnostics
+                    for r in ajax_responses:
+                        extra = ""
+                        if r.get("cf7_status"):
+                            extra = f" [CF7: {r['cf7_status']}]"
+                        log(f"  → {r['status']} {r['url'][:120]}{extra}")
                     form_data["is_ajax_submission"] = True
                     form_data["has_successful_ajax"] = len(successful_ajax) > 0
                     if successful_ajax:
@@ -1910,7 +1968,7 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
                 save_cache(cache, session_id=session_id)
                 # P2-1: Guaranteed removal of per-form AJAX listeners (BUG-06)
                 page.remove_listener("request", req_handler)
-                page.remove_listener("response", res_handler)
+                page.remove_listener("response", _capture_response_crawl)
 
             await page.wait_for_timeout(2000)
 
