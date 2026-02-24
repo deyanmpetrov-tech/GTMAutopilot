@@ -334,6 +334,7 @@ class PipelineOrchestrator:
                     discovery_data=discovery,
                     model=self._config.model,
                     log_callback=self._listener.on_log,
+                    session_id=self._config.session_id,
                 ),
             )
             self._result.form_classifications = classifications

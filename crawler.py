@@ -61,15 +61,22 @@ def load_cache(session_id: str | None = None) -> set:
     return set()
 
 def save_cache(cache: set, session_id: str | None = None):
-    """Save submitted form hashes to cache. P2-11: File locking for concurrent safety."""
-    import fcntl
+    """Save submitted form hashes to cache. P2-11: Atomic write via tempfile + os.replace()."""
+    import tempfile
     path = _get_cache_path(session_id)
-    with open(path, 'w') as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
+    dir_name = os.path.dirname(path) or "."
+    os.makedirs(dir_name, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, 'w') as f:
             json.dump(list(cache), f)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        os.replace(tmp_path, path)  # Atomic on POSIX
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 # ── BrowserSession: shared browser lifecycle for all crawler functions ────────
 
@@ -347,6 +354,8 @@ async def discover_form_pages(base_url: str, max_pages: int = 4, browser_pool=No
                     continue
         except Exception:
             pass
+        finally:
+            await page.close()  # BUG-02: Guarantee page cleanup to prevent resource leaks
 
     if browser_pool:
         async with browser_pool.acquire_context() as context:
@@ -1087,17 +1096,13 @@ async def measure_forms(
                 form_was_connected = False
 
             try:
-                # CANONICAL SUBMISSION STRATEGY
+                # CANONICAL SUBMISSION STRATEGY (BUG-03 + CROSS-03: separated click from navigation wait)
                 submit_btn = form.locator('button[type="submit"], input[type="submit"], button:has-text("Изпрати"), button:has-text("Submit"), button:has-text("Send"), .wpcf7-submit')
                 did_click = False
                 if await submit_btn.count() > 0:
                     try:
                         log(f"[Measure] Attempting button click...")
-                        try:
-                            async with page.expect_navigation(timeout=3000):
-                                await submit_btn.first.click(timeout=2000)
-                        except Exception:
-                            pass
+                        await submit_btn.first.click(timeout=2000)
                         did_click = True
                     except Exception as e:
                         log(f"[Measure] Click failed: {e}")
@@ -1105,11 +1110,7 @@ async def measure_forms(
                 if not did_click:
                     try:
                         log(f"[Measure] Trying requestSubmit()...")
-                        try:
-                            async with page.expect_navigation(timeout=3000):
-                                await form.evaluate("el => el.requestSubmit()")
-                        except Exception:
-                            pass
+                        await form.evaluate("el => el.requestSubmit()")
                         did_click = True
                     except Exception:
                         pass
@@ -1117,12 +1118,15 @@ async def measure_forms(
                 if not did_click:
                     try:
                         log(f"[Measure] Falling back to el.submit()...")
-                        async with page.expect_navigation(timeout=3000):
-                            await form.evaluate("el => el.submit()")
+                        await form.evaluate("el => el.submit()")
                     except Exception:
                         pass
 
-                await page.wait_for_timeout(5000)
+                # Wait for navigation or AJAX completion (replaces deprecated expect_navigation)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
 
                 current_full_url = page.url
                 if "#wpcf7" in current_full_url or "#confirmation" in current_full_url:
@@ -1132,193 +1136,196 @@ async def measure_forms(
             except Exception as e:
                 log(f"[Measure] Submission error: {e}")
 
-            # Evaluate AJAX activity
-            successful_ajax = [res for res in ajax_responses if 200 <= res["status"] < 300]
-            if not form_data["redirect_url"] and len(ajax_requests) > 0:
-                log(f"[Measure] Detected {len(ajax_requests)} background requests ({len(successful_ajax)} successful).")
-                form_data["is_ajax_submission"] = True
-                form_data["has_successful_ajax"] = len(successful_ajax) > 0
-                if successful_ajax:
-                    form_data["ajax_endpoint"] = successful_ajax[0]["url"]
-
+            # BUG-01: Wrap post-submission processing in try/finally to guarantee listener cleanup
             try:
-                form_is_connected = await form.evaluate("el => el.isConnected")
-            except Exception:
-                form_is_connected = False
+                # Evaluate AJAX activity
+                successful_ajax = [res for res in ajax_responses if 200 <= res["status"] < 300]
+                if not form_data["redirect_url"] and len(ajax_requests) > 0:
+                    log(f"[Measure] Detected {len(ajax_requests)} background requests ({len(successful_ajax)} successful).")
+                    form_data["is_ajax_submission"] = True
+                    form_data["has_successful_ajax"] = len(successful_ajax) > 0
+                    if successful_ajax:
+                        form_data["ajax_endpoint"] = successful_ajax[0]["url"]
 
-            form_data["is_spa_unmounted"] = form_was_connected and not form_is_connected
-            if form_data["is_spa_unmounted"]:
-                log("[Measure] SPA Form Unmount detected.")
-
-            form_data["datalayer_events"] = datalayer_events[dl_start_len:]
-
-            # DataLayer Diff — after submit
-            try:
-                dl_after_keys = set(await page.evaluate("""
-                    () => {
-                        const flat = {};
-                        (window.dataLayer || []).forEach(obj => {
-                            if (typeof obj === 'object' && !Array.isArray(obj))
-                                Object.keys(obj).forEach(k => flat[k] = true);
-                        });
-                        return Object.keys(flat);
-                    }
-                """))
-                dl_ignored = {"event", "gtm.uniqueEventId", "gtm.start", "gtm.element",
-                              "gtm.elementClasses", "gtm.elementId", "gtm.elementTarget", "gtm.elementUrl"}
-                form_data["datalayer_diff"] = {
-                    "added_keys": list((dl_after_keys - dl_before_keys) - dl_ignored),
-                }
-                if form_data["datalayer_diff"]["added_keys"]:
-                    log(f"[Measure] DataLayer Diff: {form_data['datalayer_diff']['added_keys']} new keys")
-            except Exception:
-                form_data["datalayer_diff"] = {"added_keys": []}
-
-            # Dynamic redirect detection
-            if form_data.get("redirect_url"):
-                import re as _re
-                redirect_path = urlparse(form_data["redirect_url"]).path
-                full_redirect = form_data["redirect_url"]
-                if _re.search(r'[?&][a-z_]+=\d+', full_redirect) or _re.search(r'/\d+(/|$)', redirect_path):
-                    form_data["redirect_is_dynamic"] = True
-                else:
-                    form_data["redirect_is_dynamic"] = False
-
-            # Data Type Inference
-            dl_events_after = datalayer_events[dl_start_len:]
-            payload_schema = {}
-            for ev in dl_events_after:
-                if isinstance(ev, list) and len(ev) > 0 and isinstance(ev[0], dict):
-                    for k, v in ev[0].items():
-                        if k in {"event", "gtm.uniqueEventId", "gtm.start"}:
-                            continue
-                        if isinstance(v, bool):      payload_schema[k] = "boolean"
-                        elif isinstance(v, int):     payload_schema[k] = "integer"
-                        elif isinstance(v, float):   payload_schema[k] = "number"
-                        elif isinstance(v, list):    payload_schema[k] = "array"
-                        elif isinstance(v, dict):    payload_schema[k] = "object"
-                        else:                        payload_schema[k] = "string"
-            form_data["payload_schema"] = payload_schema
-
-            # Success element detection
-            SUCCESS_SELECTORS = [
-                # CF7 (classic + v5.6+)
-                ".wpcf7-mail-sent-ok",
-                ".wpcf7 form.sent .wpcf7-response-output",
-                ".wpcf7-response-output[role='alert']",
-                # Gravity Forms
-                ".gform_confirmation_message",
-                # WPForms
-                ".wpforms-confirmation",
-                # Formidable Forms
-                ".frm_message",
-                # MailChimp embedded
-                ".mce-success-response[style*='display: block']",
-                "#mce-success-response:not([style*='display: none'])",
-                # Generic success patterns
-                "[class*='success'][style*='display: block']",
-                "[class*='thank-you']",
-                "[class*='confirmation']",
-            ]
-            form_data["success_element_selector"] = None
-            form_data["is_successful_submission"] = False
-            for selector in SUCCESS_SELECTORS:
                 try:
-                    count = await page.locator(selector).count()
-                    if count > 0:
-                        is_visible = await page.locator(selector).first.is_visible()
-                        if is_visible:
-                            form_data["success_element_selector"] = selector
-                            form_data["success_message_text"] = await page.locator(selector).first.inner_text()
-                            form_data["is_successful_submission"] = True
-                            log(f"[Measure] Success element: {selector}")
-                            break
+                    form_is_connected = await form.evaluate("el => el.isConnected")
                 except Exception:
-                    pass
+                    form_is_connected = False
 
-            # Determine if submission was successful
-            has_dl_event = any(isinstance(e, list) and len(e) > 0 and isinstance(e[0], dict) and e[0].get("event") for e in form_data.get("datalayer_events", []))
-            if form_data.get("redirect_url") or form_data.get("success_element_selector") or has_dl_event or form_data.get("has_successful_ajax") or form_data.get("is_spa_unmounted"):
-                form_data["is_successful_submission"] = True
+                form_data["is_spa_unmounted"] = form_was_connected and not form_is_connected
+                if form_data["is_spa_unmounted"]:
+                    log("[Measure] SPA Form Unmount detected.")
 
-            # Build available_tracking_methods
-            form_data["available_tracking_methods"] = []
+                form_data["datalayer_events"] = datalayer_events[dl_start_len:]
 
-            if has_dl_event:
-                dl_obj = next((e[0] for e in form_data.get("datalayer_events", []) if isinstance(e, list) and len(e) > 0 and isinstance(e[0], dict) and e[0].get("event")), {})
-                custom_event_name = dl_obj.get("event", "custom_event")
-                cond = {"event": custom_event_name}
-                if form_data.get("cf7_form_id"):
-                    cond["cf7_form_id"] = form_data["cf7_form_id"]
-                elif form_data.get("form_id"):
-                    cond["form_id"] = form_data["form_id"]
-                ignored_keys = {"event", "gtm.uniqueEventId", "gtm.start", "gtm.element", "gtm.elementClasses", "gtm.elementId", "gtm.elementTarget", "gtm.elementUrl"}
-                payload_keys = [k for k in dl_obj.keys() if k not in ignored_keys]
-                form_data["available_tracking_methods"].append({
-                    "method": "custom_event", "priority": 1,
-                    "reason": "Found explicit custom dataLayer event during submission.",
-                    "trigger_condition": cond, "payload_keys": payload_keys
-                })
+                # DataLayer Diff — after submit
+                try:
+                    dl_after_keys = set(await page.evaluate("""
+                        () => {
+                            const flat = {};
+                            (window.dataLayer || []).forEach(obj => {
+                                if (typeof obj === 'object' && !Array.isArray(obj))
+                                    Object.keys(obj).forEach(k => flat[k] = true);
+                            });
+                            return Object.keys(flat);
+                        }
+                    """))
+                    dl_ignored = {"event", "gtm.uniqueEventId", "gtm.start", "gtm.element",
+                                  "gtm.elementClasses", "gtm.elementId", "gtm.elementTarget", "gtm.elementUrl"}
+                    form_data["datalayer_diff"] = {
+                        "added_keys": list((dl_after_keys - dl_before_keys) - dl_ignored),
+                    }
+                    if form_data["datalayer_diff"]["added_keys"]:
+                        log(f"[Measure] DataLayer Diff: {form_data['datalayer_diff']['added_keys']} new keys")
+                except Exception:
+                    form_data["datalayer_diff"] = {"added_keys": []}
 
-            if form_data.get("is_spa_unmounted"):
-                form_data["available_tracking_methods"].append({
-                    "method": "ajax_complete", "priority": 3,
-                    "reason": "SPA: Form was unmounted from DOM upon success.",
-                    "trigger_condition": {"event": "ajaxComplete"}
-                })
+                # Dynamic redirect detection
+                if form_data.get("redirect_url"):
+                    import re as _re
+                    redirect_path = urlparse(form_data["redirect_url"]).path
+                    full_redirect = form_data["redirect_url"]
+                    if _re.search(r'[?&][a-z_]+=\d+', full_redirect) or _re.search(r'/\d+(/|$)', redirect_path):
+                        form_data["redirect_is_dynamic"] = True
+                    else:
+                        form_data["redirect_is_dynamic"] = False
 
-            if form_data.get("success_element_selector"):
-                form_data["available_tracking_methods"].append({
-                    "method": "element_visibility", "priority": 2,
-                    "reason": "Detected visible success message after submission.",
-                    "trigger_condition": {"selector": form_data["success_element_selector"]},
-                    "payload_keys": form_data.get("dom_payload_keys", [])
-                })
+                # Data Type Inference
+                dl_events_after = datalayer_events[dl_start_len:]
+                payload_schema = {}
+                for ev in dl_events_after:
+                    if isinstance(ev, list) and len(ev) > 0 and isinstance(ev[0], dict):
+                        for k, v in ev[0].items():
+                            if k in {"event", "gtm.uniqueEventId", "gtm.start"}:
+                                continue
+                            if isinstance(v, bool):      payload_schema[k] = "boolean"
+                            elif isinstance(v, int):     payload_schema[k] = "integer"
+                            elif isinstance(v, float):   payload_schema[k] = "number"
+                            elif isinstance(v, list):    payload_schema[k] = "array"
+                            elif isinstance(v, dict):    payload_schema[k] = "object"
+                            else:                        payload_schema[k] = "string"
+                form_data["payload_schema"] = payload_schema
 
-            if form_data.get("redirect_url"):
-                parsed_redir = urlparse(form_data["redirect_url"])
-                cond = {"page_path": parsed_redir.path}
-                if parsed_redir.fragment:
-                    cond["fragment"] = parsed_redir.fragment
-                form_data["available_tracking_methods"].append({
-                    "method": "page_view", "priority": 3,
-                    "reason": "User redirected to new URL after submission.",
-                    "trigger_condition": cond,
-                    "payload_keys": form_data.get("dom_payload_keys", [])
-                })
+                # Success element detection
+                SUCCESS_SELECTORS = [
+                    # CF7 (classic + v5.6+)
+                    ".wpcf7-mail-sent-ok",
+                    ".wpcf7 form.sent .wpcf7-response-output",
+                    ".wpcf7-response-output[role='alert']",
+                    # Gravity Forms
+                    ".gform_confirmation_message",
+                    # WPForms
+                    ".wpforms-confirmation",
+                    # Formidable Forms
+                    ".frm_message",
+                    # MailChimp embedded
+                    ".mce-success-response[style*='display: block']",
+                    "#mce-success-response:not([style*='display: none'])",
+                    # Generic success patterns
+                    "[class*='success'][style*='display: block']",
+                    "[class*='thank-you']",
+                    "[class*='confirmation']",
+                ]
+                form_data["success_element_selector"] = None
+                form_data["is_successful_submission"] = False
+                for selector in SUCCESS_SELECTORS:
+                    try:
+                        count = await page.locator(selector).count()
+                        if count > 0:
+                            is_visible = await page.locator(selector).first.is_visible()
+                            if is_visible:
+                                form_data["success_element_selector"] = selector
+                                form_data["success_message_text"] = await page.locator(selector).first.inner_text()
+                                form_data["is_successful_submission"] = True
+                                log(f"[Measure] Success element: {selector}")
+                                break
+                    except Exception:
+                        pass
 
-            if not form_data.get("is_ajax_submission") and (form_data.get("form_id") or form_data.get("form_classes")):
-                cond = {}
-                if form_data.get("form_id"):
-                    cond = {"key": "id", "value": form_data["form_id"]}
-                elif form_data.get("form_classes"):
-                    cond = {"key": "class", "value": form_data["form_classes"]}
-                if cond:
+                # Determine if submission was successful
+                has_dl_event = any(isinstance(e, list) and len(e) > 0 and isinstance(e[0], dict) and e[0].get("event") for e in form_data.get("datalayer_events", []))
+                if form_data.get("redirect_url") or form_data.get("success_element_selector") or has_dl_event or form_data.get("has_successful_ajax") or form_data.get("is_spa_unmounted"):
+                    form_data["is_successful_submission"] = True
+
+                # Build available_tracking_methods
+                form_data["available_tracking_methods"] = []
+
+                if has_dl_event:
+                    dl_obj = next((e[0] for e in form_data.get("datalayer_events", []) if isinstance(e, list) and len(e) > 0 and isinstance(e[0], dict) and e[0].get("event")), {})
+                    custom_event_name = dl_obj.get("event", "custom_event")
+                    cond = {"event": custom_event_name}
+                    if form_data.get("cf7_form_id"):
+                        cond["cf7_form_id"] = form_data["cf7_form_id"]
+                    elif form_data.get("form_id"):
+                        cond["form_id"] = form_data["form_id"]
+                    ignored_keys = {"event", "gtm.uniqueEventId", "gtm.start", "gtm.element", "gtm.elementClasses", "gtm.elementId", "gtm.elementTarget", "gtm.elementUrl"}
+                    payload_keys = [k for k in dl_obj.keys() if k not in ignored_keys]
                     form_data["available_tracking_methods"].append({
-                        "method": "form_submission", "priority": 4,
-                        "reason": "Standard HTML form submission with identifying attributes.",
+                        "method": "custom_event", "priority": 1,
+                        "reason": "Found explicit custom dataLayer event during submission.",
+                        "trigger_condition": cond, "payload_keys": payload_keys
+                    })
+
+                if form_data.get("is_spa_unmounted"):
+                    form_data["available_tracking_methods"].append({
+                        "method": "ajax_complete", "priority": 3,
+                        "reason": "SPA: Form was unmounted from DOM upon success.",
+                        "trigger_condition": {"event": "ajaxComplete"}
+                    })
+
+                if form_data.get("success_element_selector"):
+                    form_data["available_tracking_methods"].append({
+                        "method": "element_visibility", "priority": 2,
+                        "reason": "Detected visible success message after submission.",
+                        "trigger_condition": {"selector": form_data["success_element_selector"]},
+                        "payload_keys": form_data.get("dom_payload_keys", [])
+                    })
+
+                if form_data.get("redirect_url"):
+                    parsed_redir = urlparse(form_data["redirect_url"])
+                    cond = {"page_path": parsed_redir.path}
+                    if parsed_redir.fragment:
+                        cond["fragment"] = parsed_redir.fragment
+                    form_data["available_tracking_methods"].append({
+                        "method": "page_view", "priority": 3,
+                        "reason": "User redirected to new URL after submission.",
                         "trigger_condition": cond,
                         "payload_keys": form_data.get("dom_payload_keys", [])
                     })
 
-            if form_data.get("has_successful_ajax"):
-                form_data["available_tracking_methods"].append({
-                    "method": "ajax_complete", "priority": 2,
-                    "reason": "AJAX submission succeeded. Utilizing Bounteous AJAX listener.",
-                    "trigger_condition": {"event": "ajaxComplete"}
-                })
+                if not form_data.get("is_ajax_submission") and (form_data.get("form_id") or form_data.get("form_classes")):
+                    cond = {}
+                    if form_data.get("form_id"):
+                        cond = {"key": "id", "value": form_data["form_id"]}
+                    elif form_data.get("form_classes"):
+                        cond = {"key": "class", "value": form_data["form_classes"]}
+                    if cond:
+                        form_data["available_tracking_methods"].append({
+                            "method": "form_submission", "priority": 4,
+                            "reason": "Standard HTML form submission with identifying attributes.",
+                            "trigger_condition": cond,
+                            "payload_keys": form_data.get("dom_payload_keys", [])
+                        })
 
-            form_data["form_submitted"] = True
-            result["forms_processed"].append(form_data)
+                if form_data.get("has_successful_ajax"):
+                    form_data["available_tracking_methods"].append({
+                        "method": "ajax_complete", "priority": 2,
+                        "reason": "AJAX submission succeeded. Utilizing Bounteous AJAX listener.",
+                        "trigger_condition": {"event": "ajaxComplete"}
+                    })
 
-            # Cache it
-            if target_hash:
-                cache.add(target_hash)
-                save_cache(cache, session_id=session_id)
-
-            # P2-1: Remove per-form AJAX listeners to prevent cross-form leakage
-            page.remove_listener("request", req_handler)
-            page.remove_listener("response", res_handler)
+                form_data["form_submitted"] = True
+                result["forms_processed"].append(form_data)
+            except Exception as e:
+                log(f"[Measure] Post-submission processing error: {e}")
+            finally:
+                # Cache submitted form regardless of post-processing errors (prevents duplicate submissions)
+                if target_hash:
+                    cache.add(target_hash)
+                    save_cache(cache, session_id=session_id)
+                # P2-1: Guaranteed removal of per-form AJAX listeners (BUG-01)
+                page.remove_listener("request", req_handler)
+                page.remove_listener("response", res_handler)
 
             await page.wait_for_timeout(2000)
 
@@ -1400,13 +1407,19 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
         for i in range(forms_count):
             # Ensure we are on the base page if a previous form navigated away
             if urlparse(page.url).netloc != urlparse(url).netloc or page.url != url:
-                log(f"Redirected detected during crawl. Returning to base URL: {url}")
+                log(f"Redirect detected during crawl. Returning to base URL: {url}")
                 await page.goto(url, wait_until="domcontentloaded", timeout=navigation_timeout)
                 await page.wait_for_load_state("load", timeout=navigation_timeout // 2)
                 await page.wait_for_timeout(3000)
                 await sweep_popups(page, log)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(3000)
+
+                # BUG-05: Re-validate form count after re-navigation (DOM may have changed)
+                new_forms_count = await page.locator('form').count()
+                if i >= new_forms_count:
+                    log(f"Form #{i+1} no longer exists after re-navigation ({new_forms_count} form(s) now). Stopping.")
+                    break
 
             form = page.locator('form').nth(i)
             form_data = {
@@ -1662,16 +1675,13 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
                 form_was_connected = False
 
             try:
+                # CANONICAL SUBMISSION STRATEGY (BUG-03 + CROSS-03: separated click from navigation wait)
                 submit_btn = form.locator('button[type="submit"], input[type="submit"], button:has-text("Изпрати"), button:has-text("Submit"), button:has-text("Send"), .wpcf7-submit')
                 did_click = False
                 if await submit_btn.count() > 0:
                     try:
                         log(f"  → Attempting button click (Selector: {await submit_btn.first.evaluate('el => el.className')})")
-                        try:
-                            async with page.expect_navigation(timeout=3000):
-                                await submit_btn.first.click(timeout=2000)
-                        except Exception:
-                            pass
+                        await submit_btn.first.click(timeout=2000)
                         did_click = True
                     except Exception as e:
                         log(f"  ↳ Click failed: {e}")
@@ -1679,11 +1689,7 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
                 if not did_click:
                     try:
                         log(f"  → Standard click failed. Trying requestSubmit().")
-                        try:
-                            async with page.expect_navigation(timeout=3000):
-                                await form.evaluate("el => el.requestSubmit()")
-                        except Exception:
-                            pass
+                        await form.evaluate("el => el.requestSubmit()")
                         did_click = True
                     except Exception:
                         pass
@@ -1691,12 +1697,15 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
                 if not did_click:
                     try:
                         log(f"  → All canonical methods failed. Falling back to direct el.submit().")
-                        async with page.expect_navigation(timeout=3000):
-                            await form.evaluate("el => el.submit()")
+                        await form.evaluate("el => el.submit()")
                     except Exception:
                         pass
 
-                await page.wait_for_timeout(5000)
+                # Wait for navigation or AJAX completion (replaces deprecated expect_navigation)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
 
                 current_full_url = page.url
                 if "#wpcf7" in current_full_url or "#confirmation" in current_full_url:
@@ -1706,198 +1715,202 @@ async def crawl_site(url: str, log_callback=None, ignore_cache=False, debug_dir=
             except Exception as e:
                 log(f"  ⚠️ Submission error for form #{i+1}: {e}")
 
-            # Evaluate AJAX activity
-            successful_ajax = [res for res in ajax_responses if 200 <= res["status"] < 300]
-            if not form_data["redirect_url"] and len(ajax_requests) > 0:
-                 log(f"Detected {len(ajax_requests)} background API requests ({len(successful_ajax)} successful) after clicking submit.")
-                 form_data["is_ajax_submission"] = True
-                 form_data["has_successful_ajax"] = len(successful_ajax) > 0
-                 if successful_ajax:
-                     form_data["ajax_endpoint"] = successful_ajax[0]["url"]
-
+            # BUG-06: Wrap post-submission processing in try/finally to guarantee listener cleanup
             try:
-                form_is_connected = await form.evaluate("el => el.isConnected")
-            except Exception:
-                form_is_connected = False
+                # Evaluate AJAX activity
+                successful_ajax = [res for res in ajax_responses if 200 <= res["status"] < 300]
+                if not form_data["redirect_url"] and len(ajax_requests) > 0:
+                    log(f"Detected {len(ajax_requests)} background API requests ({len(successful_ajax)} successful) after clicking submit.")
+                    form_data["is_ajax_submission"] = True
+                    form_data["has_successful_ajax"] = len(successful_ajax) > 0
+                    if successful_ajax:
+                        form_data["ajax_endpoint"] = successful_ajax[0]["url"]
 
-            form_data["is_spa_unmounted"] = form_was_connected and not form_is_connected
-            if form_data["is_spa_unmounted"]:
-                 log("  → SPA Form Unmount detected (form removed from DOM after submission).")
-
-            form_data["datalayer_events"] = datalayer_events[dl_start_len:]
-
-            try:
-                dl_after_keys = set(await page.evaluate("""
-                    () => {
-                        const flat = {};
-                        (window.dataLayer || []).forEach(obj => {
-                            if (typeof obj === 'object' && !Array.isArray(obj))
-                                Object.keys(obj).forEach(k => flat[k] = true);
-                        });
-                        return Object.keys(flat);
-                    }
-                """))
-                dl_ignored = {"event", "gtm.uniqueEventId", "gtm.start", "gtm.element",
-                              "gtm.elementClasses", "gtm.elementId", "gtm.elementTarget", "gtm.elementUrl"}
-                form_data["datalayer_diff"] = {
-                    "added_keys": list((dl_after_keys - dl_before_keys) - dl_ignored),
-                }
-                if form_data["datalayer_diff"]["added_keys"]:
-                    log(f"  → DataLayer Diff: {form_data['datalayer_diff']['added_keys']} new keys after submit")
-            except Exception:
-                form_data["datalayer_diff"] = {"added_keys": []}
-
-            if form_data.get("redirect_url"):
-                import re as _re
-                redirect_path = urlparse(form_data["redirect_url"]).path
-                full_redirect = form_data["redirect_url"]
-                if _re.search(r'[?&][a-z_]+=\d+', full_redirect) or _re.search(r'/\d+(/|$)', redirect_path):
-                    form_data["redirect_is_dynamic"] = True
-                    log(f"  → Dynamic redirect detected. Delegating Regex generation to AI.")
-                else:
-                    form_data["redirect_is_dynamic"] = False
-
-            dl_events_after = datalayer_events[dl_start_len:]
-            payload_schema = {}
-            for ev in dl_events_after:
-                if isinstance(ev, list) and len(ev) > 0 and isinstance(ev[0], dict):
-                    for k, v in ev[0].items():
-                        if k in {"event", "gtm.uniqueEventId", "gtm.start"}: continue
-                        if isinstance(v, bool):      payload_schema[k] = "boolean"
-                        elif isinstance(v, int):     payload_schema[k] = "integer"
-                        elif isinstance(v, float):   payload_schema[k] = "number"
-                        elif isinstance(v, list):    payload_schema[k] = "array"
-                        elif isinstance(v, dict):    payload_schema[k] = "object"
-                        else:                        payload_schema[k] = "string"
-            form_data["payload_schema"] = payload_schema
-            if payload_schema:
-                log(f"  → Type inference: {payload_schema}")
-
-            form_data["form_id"] = attributes.get("id")
-            form_data["form_classes"] = attributes.get("class")
-            form_data["form_action"] = attributes.get("action")
-
-            SUCCESS_SELECTORS = [
-                # CF7 (classic + v5.6+)
-                ".wpcf7-mail-sent-ok",
-                ".wpcf7 form.sent .wpcf7-response-output",
-                ".wpcf7-response-output[role='alert']",
-                # Gravity Forms
-                ".gform_confirmation_message",
-                # WPForms
-                ".wpforms-confirmation",
-                # Formidable Forms
-                ".frm_message",
-                # MailChimp embedded
-                ".mce-success-response[style*='display: block']",
-                "#mce-success-response:not([style*='display: none'])",
-                # Generic success patterns
-                "[class*='success'][style*='display: block']",
-                "[class*='thank-you']",
-                "[class*='confirmation']",
-            ]
-            form_data["success_element_selector"] = None
-            form_data["is_successful_submission"] = False
-            for selector in SUCCESS_SELECTORS:
                 try:
-                    count = await page.locator(selector).count()
-                    if count > 0:
-                        is_visible = await page.locator(selector).first.is_visible()
-                        if is_visible:
-                            form_data["success_element_selector"] = selector
-                            form_data["success_message_text"] = await page.locator(selector).first.inner_text()
-                            form_data["is_successful_submission"] = True
-                            log(f"  → Success element detected: {selector} (Text: {form_data['success_message_text'][:30]}...)")
-                            break
+                    form_is_connected = await form.evaluate("el => el.isConnected")
                 except Exception:
-                    pass
+                    form_is_connected = False
 
-            has_dl_event = any(isinstance(e, list) and len(e)>0 and isinstance(e[0], dict) and e[0].get("event") for e in form_data["datalayer_events"])
-            if form_data["redirect_url"] or form_data["success_element_selector"] or has_dl_event or form_data.get("has_successful_ajax") or form_data.get("is_spa_unmounted"):
-                form_data["is_successful_submission"] = True
+                form_data["is_spa_unmounted"] = form_was_connected and not form_is_connected
+                if form_data["is_spa_unmounted"]:
+                    log("  → SPA Form Unmount detected (form removed from DOM after submission).")
 
-            form_data["available_tracking_methods"] = []
+                form_data["datalayer_events"] = datalayer_events[dl_start_len:]
 
-            if has_dl_event:
-                dl_obj = next((e[0] for e in form_data["datalayer_events"] if isinstance(e, list) and len(e)>0 and isinstance(e[0], dict) and e[0].get("event")), {})
-                custom_event_name = dl_obj.get("event", "custom_event")
-                cond = {"event": custom_event_name}
-                if form_data.get("cf7_form_id"):
-                    cond["cf7_form_id"] = form_data["cf7_form_id"]
-                elif form_data.get("form_id"):
-                    cond["form_id"] = form_data["form_id"]
-                ignored_keys = {"event", "gtm.uniqueEventId", "gtm.start", "gtm.element", "gtm.elementClasses", "gtm.elementId", "gtm.elementTarget", "gtm.elementUrl"}
-                payload_keys = [k for k in dl_obj.keys() if k not in ignored_keys]
-                form_data["available_tracking_methods"].append({
-                    "method": "custom_event",
-                    "priority": 1,
-                    "reason": "Found explicit custom dataLayer event during submission.",
-                    "trigger_condition": cond,
-                    "payload_keys": payload_keys
-                })
+                try:
+                    dl_after_keys = set(await page.evaluate("""
+                        () => {
+                            const flat = {};
+                            (window.dataLayer || []).forEach(obj => {
+                                if (typeof obj === 'object' && !Array.isArray(obj))
+                                    Object.keys(obj).forEach(k => flat[k] = true);
+                            });
+                            return Object.keys(flat);
+                        }
+                    """))
+                    dl_ignored = {"event", "gtm.uniqueEventId", "gtm.start", "gtm.element",
+                                  "gtm.elementClasses", "gtm.elementId", "gtm.elementTarget", "gtm.elementUrl"}
+                    form_data["datalayer_diff"] = {
+                        "added_keys": list((dl_after_keys - dl_before_keys) - dl_ignored),
+                    }
+                    if form_data["datalayer_diff"]["added_keys"]:
+                        log(f"  → DataLayer Diff: {form_data['datalayer_diff']['added_keys']} new keys after submit")
+                except Exception:
+                    form_data["datalayer_diff"] = {"added_keys": []}
 
-            if form_data.get("is_spa_unmounted"):
-                form_data["available_tracking_methods"].append({
-                    "method": "ajax_complete",
-                    "priority": 3,
-                    "reason": "Single Page Application (SPA): Form was unmounted from the DOM upon success.",
-                    "trigger_condition": {"event": "ajaxComplete"}
-                })
+                if form_data.get("redirect_url"):
+                    import re as _re
+                    redirect_path = urlparse(form_data["redirect_url"]).path
+                    full_redirect = form_data["redirect_url"]
+                    if _re.search(r'[?&][a-z_]+=\d+', full_redirect) or _re.search(r'/\d+(/|$)', redirect_path):
+                        form_data["redirect_is_dynamic"] = True
+                        log(f"  → Dynamic redirect detected. Delegating Regex generation to AI.")
+                    else:
+                        form_data["redirect_is_dynamic"] = False
 
-            if form_data.get("success_element_selector"):
-                form_data["available_tracking_methods"].append({
-                    "method": "element_visibility",
-                    "priority": 2,
-                    "reason": "Detected a visible success message/element after submission.",
-                    "trigger_condition": {"selector": form_data["success_element_selector"]},
-                    "payload_keys": form_data.get("dom_payload_keys", [])
-                })
+                dl_events_after = datalayer_events[dl_start_len:]
+                payload_schema = {}
+                for ev in dl_events_after:
+                    if isinstance(ev, list) and len(ev) > 0 and isinstance(ev[0], dict):
+                        for k, v in ev[0].items():
+                            if k in {"event", "gtm.uniqueEventId", "gtm.start"}: continue
+                            if isinstance(v, bool):      payload_schema[k] = "boolean"
+                            elif isinstance(v, int):     payload_schema[k] = "integer"
+                            elif isinstance(v, float):   payload_schema[k] = "number"
+                            elif isinstance(v, list):    payload_schema[k] = "array"
+                            elif isinstance(v, dict):    payload_schema[k] = "object"
+                            else:                        payload_schema[k] = "string"
+                form_data["payload_schema"] = payload_schema
+                if payload_schema:
+                    log(f"  → Type inference: {payload_schema}")
 
-            if form_data.get("redirect_url"):
-                parsed_redir = urlparse(form_data["redirect_url"])
-                cond = {"page_path": parsed_redir.path}
-                if parsed_redir.fragment:
-                    cond["fragment"] = parsed_redir.fragment
-                form_data["available_tracking_methods"].append({
-                    "method": "page_view",
-                    "priority": 3,
-                    "reason": "User was redirected to a new URL or hash fragment after submission.",
-                    "trigger_condition": cond,
-                    "payload_keys": form_data.get("dom_payload_keys", [])
-                })
+                form_data["form_id"] = attributes.get("id")
+                form_data["form_classes"] = attributes.get("class")
+                form_data["form_action"] = attributes.get("action")
 
-            if not form_data.get("is_ajax_submission") and (form_data.get("form_id") or form_data.get("form_classes")):
-                cond = {}
-                if form_data.get("form_id"):
-                    cond = {"key": "id", "value": form_data["form_id"]}
-                elif form_data.get("form_classes"):
-                    cond = {"key": "class", "value": form_data["form_classes"]}
-                if cond:
+                SUCCESS_SELECTORS = [
+                    # CF7 (classic + v5.6+)
+                    ".wpcf7-mail-sent-ok",
+                    ".wpcf7 form.sent .wpcf7-response-output",
+                    ".wpcf7-response-output[role='alert']",
+                    # Gravity Forms
+                    ".gform_confirmation_message",
+                    # WPForms
+                    ".wpforms-confirmation",
+                    # Formidable Forms
+                    ".frm_message",
+                    # MailChimp embedded
+                    ".mce-success-response[style*='display: block']",
+                    "#mce-success-response:not([style*='display: none'])",
+                    # Generic success patterns
+                    "[class*='success'][style*='display: block']",
+                    "[class*='thank-you']",
+                    "[class*='confirmation']",
+                ]
+                form_data["success_element_selector"] = None
+                form_data["is_successful_submission"] = False
+                for selector in SUCCESS_SELECTORS:
+                    try:
+                        count = await page.locator(selector).count()
+                        if count > 0:
+                            is_visible = await page.locator(selector).first.is_visible()
+                            if is_visible:
+                                form_data["success_element_selector"] = selector
+                                form_data["success_message_text"] = await page.locator(selector).first.inner_text()
+                                form_data["is_successful_submission"] = True
+                                log(f"  → Success element detected: {selector} (Text: {form_data['success_message_text'][:30]}...)")
+                                break
+                    except Exception:
+                        pass
+
+                has_dl_event = any(isinstance(e, list) and len(e)>0 and isinstance(e[0], dict) and e[0].get("event") for e in form_data["datalayer_events"])
+                if form_data["redirect_url"] or form_data["success_element_selector"] or has_dl_event or form_data.get("has_successful_ajax") or form_data.get("is_spa_unmounted"):
+                    form_data["is_successful_submission"] = True
+
+                form_data["available_tracking_methods"] = []
+
+                if has_dl_event:
+                    dl_obj = next((e[0] for e in form_data["datalayer_events"] if isinstance(e, list) and len(e)>0 and isinstance(e[0], dict) and e[0].get("event")), {})
+                    custom_event_name = dl_obj.get("event", "custom_event")
+                    cond = {"event": custom_event_name}
+                    if form_data.get("cf7_form_id"):
+                        cond["cf7_form_id"] = form_data["cf7_form_id"]
+                    elif form_data.get("form_id"):
+                        cond["form_id"] = form_data["form_id"]
+                    ignored_keys = {"event", "gtm.uniqueEventId", "gtm.start", "gtm.element", "gtm.elementClasses", "gtm.elementId", "gtm.elementTarget", "gtm.elementUrl"}
+                    payload_keys = [k for k in dl_obj.keys() if k not in ignored_keys]
                     form_data["available_tracking_methods"].append({
-                        "method": "form_submission",
-                        "priority": 4,
-                        "reason": "Standard HTML form submission detected with identifying attributes.",
+                        "method": "custom_event",
+                        "priority": 1,
+                        "reason": "Found explicit custom dataLayer event during submission.",
+                        "trigger_condition": cond,
+                        "payload_keys": payload_keys
+                    })
+
+                if form_data.get("is_spa_unmounted"):
+                    form_data["available_tracking_methods"].append({
+                        "method": "ajax_complete",
+                        "priority": 3,
+                        "reason": "Single Page Application (SPA): Form was unmounted from the DOM upon success.",
+                        "trigger_condition": {"event": "ajaxComplete"}
+                    })
+
+                if form_data.get("success_element_selector"):
+                    form_data["available_tracking_methods"].append({
+                        "method": "element_visibility",
+                        "priority": 2,
+                        "reason": "Detected a visible success message/element after submission.",
+                        "trigger_condition": {"selector": form_data["success_element_selector"]},
+                        "payload_keys": form_data.get("dom_payload_keys", [])
+                    })
+
+                if form_data.get("redirect_url"):
+                    parsed_redir = urlparse(form_data["redirect_url"])
+                    cond = {"page_path": parsed_redir.path}
+                    if parsed_redir.fragment:
+                        cond["fragment"] = parsed_redir.fragment
+                    form_data["available_tracking_methods"].append({
+                        "method": "page_view",
+                        "priority": 3,
+                        "reason": "User was redirected to a new URL or hash fragment after submission.",
                         "trigger_condition": cond,
                         "payload_keys": form_data.get("dom_payload_keys", [])
                     })
 
-            if form_data.get("has_successful_ajax"):
-                form_data["available_tracking_methods"].append({
-                    "method": "ajax_complete",
-                    "priority": 2,
-                    "reason": "AJAX submission succeeded. Utilizing Bounteous AJAX listener.",
-                    "trigger_condition": {"event": "ajaxComplete"}
-                })
+                if not form_data.get("is_ajax_submission") and (form_data.get("form_id") or form_data.get("form_classes")):
+                    cond = {}
+                    if form_data.get("form_id"):
+                        cond = {"key": "id", "value": form_data["form_id"]}
+                    elif form_data.get("form_classes"):
+                        cond = {"key": "class", "value": form_data["form_classes"]}
+                    if cond:
+                        form_data["available_tracking_methods"].append({
+                            "method": "form_submission",
+                            "priority": 4,
+                            "reason": "Standard HTML form submission detected with identifying attributes.",
+                            "trigger_condition": cond,
+                            "payload_keys": form_data.get("dom_payload_keys", [])
+                        })
 
-            form_data["form_submitted"] = True
-            result["forms_processed"].append(form_data)
+                if form_data.get("has_successful_ajax"):
+                    form_data["available_tracking_methods"].append({
+                        "method": "ajax_complete",
+                        "priority": 2,
+                        "reason": "AJAX submission succeeded. Utilizing Bounteous AJAX listener.",
+                        "trigger_condition": {"event": "ajaxComplete"}
+                    })
 
-            cache.add(form_hash)
-            save_cache(cache, session_id=session_id)
-
-            # P2-1: Remove per-form AJAX listeners to prevent cross-form leakage
-            page.remove_listener("request", req_handler)
-            page.remove_listener("response", res_handler)
+                form_data["form_submitted"] = True
+                result["forms_processed"].append(form_data)
+            except Exception as e:
+                log(f"  ⚠️ Post-submission processing error for form #{i+1}: {e}")
+            finally:
+                # Cache submitted form regardless of post-processing errors (prevents duplicate submissions)
+                cache.add(form_hash)
+                save_cache(cache, session_id=session_id)
+                # P2-1: Guaranteed removal of per-form AJAX listeners (BUG-06)
+                page.remove_listener("request", req_handler)
+                page.remove_listener("response", res_handler)
 
             await page.wait_for_timeout(2000)
 

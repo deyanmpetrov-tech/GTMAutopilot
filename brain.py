@@ -999,16 +999,24 @@ def _fix_ecommerce_schema(items: list[dict]) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════
 
 def _step1_analyze_platform(client, model: str, crawler_data: dict,
-                             ctx: PipelineContext, log_fn=print) -> PlatformAnalysis:
+                             ctx: PipelineContext, log_fn=print,
+                             debug_dir: str | None = None) -> PlatformAnalysis:
     """Step 1: Platform & Form Analyst with Vision Support."""
     log_fn("── Step 1: analyze_platform_and_forms()  — Platform & Form Analyst... ⏳")
-    
-    # Vision logic: load form screenshots if they exist
+
+    # CROSS-01: Vision logic — load form screenshots using correct debug_dir path
     image_parts = []
     forms = crawler_data.get("forms_processed", [])
+    _base_dir = debug_dir or ".debug"
     for f in forms:
         fi = f.get("form_index")
-        img_path = f".debug/form_{fi}.png"
+        is_shadow = f.get("is_shadow_form", False)
+        # Shadow forms use "form_shadow_N.png", regular forms use "form_N.png"
+        if is_shadow and isinstance(fi, str) and fi.startswith("shadow_"):
+            shadow_num = fi.replace("shadow_", "")
+            img_path = os.path.join(_base_dir, f"form_shadow_{shadow_num}.png")
+        else:
+            img_path = os.path.join(_base_dir, f"form_{fi}.png")
         if os.path.exists(img_path):
             try:
                 with open(img_path, "rb") as img_file:
@@ -1765,6 +1773,7 @@ def classify_forms(
     discovery_data: dict,
     model: str = "gemini-2.5-flash",
     log_callback=None,
+    session_id: str | None = None,
 ) -> dict:
     """
     Phase 1 classification: Runs Step 1 (platform + form type) on passive discovery data.
@@ -1789,7 +1798,7 @@ def classify_forms(
         "forms_processed": [
             {
                 **f,
-                "form_index": (int(f.get("form_index", i)) if str(f.get("form_index", i)).isdigit() else i),  # P1-2: safe int normalize
+                "form_index": f.get("form_index", i),  # CROSS-02: preserve original index (int for regular, "shadow_N" for shadow forms)
                 "datalayer_events": f.get("datalayer_events", []),
                 "is_successful_submission": f.get("is_successful_submission", False),
                 "dom_payload_keys": f.get("dom_payload_keys", []),
@@ -1803,7 +1812,8 @@ def classify_forms(
     }
 
     ctx = PipelineContext()
-    platform_result = _step1_analyze_platform(client, model, crawler_compat, ctx=ctx, log_fn=log_fn)
+    _debug_dir = get_debug_dir(session_id) if session_id else None
+    platform_result = _step1_analyze_platform(client, model, crawler_compat, ctx=ctx, log_fn=log_fn, debug_dir=_debug_dir)
 
     # ── Quota-aware error: raise with a clear message so the UI can display it ──
     if ctx.has_fatal():
@@ -1928,7 +1938,8 @@ def generate_tracking_plan(
             )
             log_fn(f"   ↳ ♻️ Cached: platform={overall_platform} ({overall_conf:.0%}), {len(cached_forms)} form(s)")
         else:
-            platform_result = _step1_analyze_platform(client, model, crawler_data, ctx=ctx, log_fn=log_fn)
+            platform_result = _step1_analyze_platform(client, model, crawler_data, ctx=ctx, log_fn=log_fn,
+                                                       debug_dir=get_debug_dir(session_id) if session_id else None)
         _save_debug("step1_platform", platform_result, session_id=session_id)
 
         # P1-4: Short-circuit if Step 1 failed (prevents silent empty plans)
