@@ -40,6 +40,7 @@ class PipelineContext:
     events: list[PipelineEvent] = dc_field(default_factory=list)
     api_call_count: int = 0
     _sticky_model: str | None = dc_field(default=None, repr=False)
+    _sticky_call_count: int = dc_field(default=0, repr=False)
 
     def record(self, step: str, form_index: int | None,
                severity: Severity, message: str):
@@ -779,7 +780,13 @@ def _call_gemini(client, model: str, system: str, prompt: str, schema=None,
     # ── Sticky model: reuse last successful fallback to skip cascade ──
     effective_model = model
     if ctx and ctx._sticky_model and ctx._sticky_model != model:
-        effective_model = ctx._sticky_model
+        ctx._sticky_call_count += 1
+        if ctx._sticky_call_count >= 5:
+            # Periodically retry primary model to check if it's back
+            ctx._sticky_call_count = 0
+            ctx._sticky_model = None
+        else:
+            effective_model = ctx._sticky_model
 
     # ── Attempt 1: Primary (or sticky) model ──
     try:
@@ -1033,27 +1040,33 @@ def _step2_validate_signals(client, model: str, crawler_data: dict, platform_res
     validations: list[SuccessValidation] = []
     forms_processed = crawler_data.get("forms_processed", [])
 
-    for form_data in forms_processed:
-        fi = form_data.get("form_index")
+    for i, form_data in enumerate(forms_processed):
+        _raw_fi = form_data.get("form_index", i)
+        try:
+            fi = int(_raw_fi)
+        except (ValueError, TypeError):
+            fi = i  # Fallback for non-numeric indices like "shadow_0"
         is_shadow = form_data.get("is_shadow_form", False)
 
         # ── User-Selected Method Passthrough ─────────────────────────
         # If the user already chose a tracking method in the Signal Review UI,
         # skip the LLM call entirely and construct a SuccessValidation directly.
         user_method = form_data.get("_user_selected_method")
-        if user_method and user_method != "auto":
-            user_atm = (form_data.get("available_tracking_methods") or [{}])[0]
+        user_atm_list = form_data.get("available_tracking_methods") or []
+        if user_method and user_method != "auto" and user_atm_list:
+            user_atm = user_atm_list[0]
             user_cond = _map_crawler_trigger_condition(user_atm.get("trigger_condition", {}))
-            result = SuccessValidation(
-                form_index=fi,
-                is_genuine_success=True,
-                best_method=user_method,
-                method_confidence=1.0,  # User-selected = full confidence
-                trigger_condition=TriggerCondition(**user_cond),
-            )
-            log_fn(f"   ↳ ✅ Form #{fi}: `{user_method}` (100% — user-selected)")
-            validations.append(result)
-            continue
+            if any(v is not None for v in user_cond.values()):
+                result = SuccessValidation(
+                    form_index=fi,
+                    is_genuine_success=True,
+                    best_method=user_method,
+                    method_confidence=1.0,  # User-selected = full confidence
+                    trigger_condition=TriggerCondition(**user_cond),
+                )
+                log_fn(f"   ↳ ✅ Form #{fi}: `{user_method}` (100% — user-selected)")
+                validations.append(result)
+                continue
 
         if not is_shadow and not form_data.get("is_successful_submission"):
             log_fn(f"   ↳ Form #{fi or '?'} skipped — no success signal detected by crawler")
@@ -1417,6 +1430,19 @@ def _step5_audit_and_compile(client, model: str,
         print("  ⚠ No items to audit. Returning empty plan.")
         return {"tracking_plan": []}
 
+    # ── Preserve _source_form_index before AI audit (BUG-2 fix) ──
+    # Use (event_name, position_among_same_event) as composite key to handle
+    # multiple forms sharing the same event_name (e.g. two "form_submit" forms).
+    _fi_map: dict[tuple[str, int], object] = {}
+    _event_counter: dict[str, int] = {}
+    for item in compiled_plan:
+        fi = item.get("_source_form_index")
+        if fi is not None:
+            ename = item.get("event_name", "")
+            pos = _event_counter.get(ename, 0)
+            _event_counter[ename] = pos + 1
+            _fi_map[(ename, pos)] = fi
+
     # ── Phase A: Deterministic micro-fixers (cheap, no API calls) ──
     compiled_plan = _fix_regex_patterns(compiled_plan)
     compiled_plan = _fix_trigger_conditions(compiled_plan)
@@ -1488,8 +1514,17 @@ Rules:
                 "qa_test_steps": it.qa_test_steps,
                 "is_shadow_form": False,        # AI audit doesn't preserve per-form metadata
                 "is_iframe_embedded": False,     # Same — use pre-audit values for display
-                "_source_form_index": None        # Not available post-audit; stripped before return
+                "_source_form_index": None,  # Restored below from pre-audit map; stripped before return
             })
+
+        # ── Restore _source_form_index from pre-audit map (BUG-2 fix) ──
+        _restore_counter: dict[str, int] = {}
+        for item in corrected_plans:
+            ename = item.get("event_name", "")
+            pos = _restore_counter.get(ename, 0)
+            _restore_counter[ename] = pos + 1
+            if item.get("_source_form_index") is None:
+                item["_source_form_index"] = _fi_map.get((ename, pos))
 
         # ── Guard against AI item reduction (P0-4) ──
         if len(corrected_plans) < len(compiled_plan):
@@ -1754,7 +1789,7 @@ def classify_forms(
         "forms_processed": [
             {
                 **f,
-                "form_index": str(f.get("form_index", i)),  # P1-2: normalize to string
+                "form_index": (int(f.get("form_index", i)) if str(f.get("form_index", i)).isdigit() else i),  # P1-2: safe int normalize
                 "datalayer_events": f.get("datalayer_events", []),
                 "is_successful_submission": f.get("is_successful_submission", False),
                 "dom_payload_keys": f.get("dom_payload_keys", []),
@@ -1785,7 +1820,7 @@ def classify_forms(
         raise RuntimeError("Класификацията на формите се провали. Проверете API ключа и квотата.")
 
     return {
-        str(f.form_index): {
+        str(f.form_index): {  # String keys — app.py accesses via str(fi)
             "form_type": f.form_type,
             "form_role": f.form_role,
             "confidence": f.platform_confidence,
@@ -1820,17 +1855,19 @@ def generate_tracking_plan(
     log_fn = log_callback if callable(log_callback) else print
 
     # ── Per-session pipeline.log: tee every log_fn call to a file ──
-    _debug_dir = get_debug_dir(session_id)
-    os.makedirs(_debug_dir, exist_ok=True)
-    _log_path = os.path.join(_debug_dir, "pipeline.log")
-    _original_log = log_fn
-    def log_fn(msg: str):
-        _original_log(msg)
-        try:
-            with open(_log_path, "a", encoding="utf-8") as _f:
-                _f.write(f"[{_time.strftime('%H:%M:%S')}] {msg}\n")
-        except Exception:
-            pass  # never fail the pipeline over logging
+    # Skip if caller already tees to pipeline.log (e.g. core_pipeline._TeeListener)
+    if not getattr(log_fn, '_tees_to_pipeline_log', False):
+        _debug_dir = get_debug_dir(session_id)
+        os.makedirs(_debug_dir, exist_ok=True)
+        _log_path = os.path.join(_debug_dir, "pipeline.log")
+        _original_log = log_fn
+        def log_fn(msg: str):
+            _original_log(msg)
+            try:
+                with open(_log_path, "a", encoding="utf-8") as _f:
+                    _f.write(f"[{_time.strftime('%H:%M:%S')}] {msg}\n")
+            except Exception:
+                pass  # never fail the pipeline over logging
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
