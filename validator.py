@@ -126,6 +126,8 @@ def validate_gtm_container(gtm: dict) -> dict:
 
     # ── 6. Auto-injected tags have valid trigger references ───────────────────
     valid_trig_ids = set(str(t.get("triggerId", "")) for t in triggers)
+    # Built-in trigger IDs that GTM always has (All Pages, DOM Ready, Window Loaded)
+    BUILTIN_TRIGGER_IDS = {"2147479553", "2147479572", "2147479573"}
     dangling = []
     for tag in tags:
         name = tag.get("name", "")
@@ -133,7 +135,7 @@ def validate_gtm_container(gtm: dict) -> dict:
         if not (name.startswith("GA4 Event") or name.startswith("Auto -")):
             continue
         for fid in tag.get("firingTriggerId", []):
-            if str(fid) not in valid_trig_ids:
+            if str(fid) not in valid_trig_ids and str(fid) not in BUILTIN_TRIGGER_IDS:
                 dangling.append(f"Tag '{name}' → triggerId={fid} (not found)")
     if dangling:
         add("Trigger references", "fail", "; ".join(dangling[:3]))

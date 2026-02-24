@@ -74,7 +74,11 @@ def heal_gtm_container(gtm_json: dict) -> dict:
                     break
     
     for tag in tags:
-        # PROTECT: If it doesn't have "Auto" or "GA4 Event" in name, skip healing
+        # tagFiringOption is required for ALL tags (GTM may reject import without it)
+        if not tag.get("tagFiringOption"):
+            tag["tagFiringOption"] = "ONCE_PER_EVENT"
+
+        # PROTECT: remaining fixes only for auto-injected tags
         if "Auto" not in tag.get("name", "") and "GA4 Event" not in tag.get("name", ""):
             continue
 
@@ -86,12 +90,9 @@ def heal_gtm_container(gtm_json: dict) -> dict:
                     has_override = True
                     if not p.get("value") or p.get("value").strip() == "":
                         p["value"] = fallback_ga_id
-            
+
             if not has_override:
                 params.append({"type": "TEMPLATE", "key": "measurementIdOverride", "value": fallback_ga_id})
-
-        if not tag.get("tagFiringOption"):
-            tag["tagFiringOption"] = "ONCE_PER_EVENT"
 
     # ── 3. Fix Trigger Required Parameters ────────────────────────────────────
     for trigger in triggers:
