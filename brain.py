@@ -1,5 +1,5 @@
 """
-brain.py — AI Tracking Plan Generator (Phase 12: 5-Step Expert Pipeline)
+brain.py — AI Tracking Plan Generator (Phase 13: 5-Step Expert Pipeline + Bug Fixes)
 Uses google-genai SDK (v1 API).
 
 Pipeline Steps:
